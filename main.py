@@ -1,3 +1,4 @@
+
 import asyncio
 import logging
 from datetime import date, timedelta
@@ -236,9 +237,58 @@ async def cancel_booking_handler(callback: CallbackQuery):
         await callback.answer("Не удалось отменить запись", show_alert=True)
 
 
+async def reminder_loop():
+    """Каждые 5 минут проверяет записи и рассылает напоминания:
+    клиенту — за день до визита, владельцу — за час до визита."""
+    while True:
+        try:
+            now = datetime.now()
+
+            # Напоминание клиенту: за ~сутки до визита (проверяем записи на завтра)
+            tomorrow = (now + timedelta(days=1)).date().isoformat()
+            for row in db.get_bookings_needing_client_reminder(tomorrow):
+                booking_id, user_id, client_name, service_name, booking_date, booking_time = row
+                try:
+                    await bot.send_message(
+                        user_id,
+                        f"Напоминаем: завтра, {format_date_human(booking_date)} в {booking_time}, "
+                        f"у вас запись — {service_name} в {config.BUSINESS_NAME}.",
+                    )
+                    db.mark_client_reminded(booking_id)
+                except Exception as e:
+                    logging.error(f"Не удалось напомнить клиенту {user_id}: {e}")
+
+            # Напоминание владельцу: за ~час до визита (окно 55-65 минут, чтобы не зависеть от точности слотов)
+            if config.ADMIN_CHAT_ID:
+                today = now.date().isoformat()
+                for row in db.get_active_bookings_for_date_needing_admin_reminder(today):
+                    booking_id, user_id, client_name, client_phone, service_name, booking_date, booking_time = row
+                    try:
+                        visit_dt = datetime.strptime(f"{booking_date} {booking_time}", "%Y-%m-%d %H:%M")
+                    except ValueError:
+                        continue
+                    minutes_until = (visit_dt - now).total_seconds() / 60
+                    if 55 <= minutes_until <= 65:
+                        try:
+                            await bot.send_message(
+                                config.ADMIN_CHAT_ID,
+                                f"⏰ Через час клиент {client_name} ({client_phone}) — "
+                                f"{service_name}, {booking_time}",
+                            )
+                            db.mark_admin_reminded(booking_id)
+                        except Exception as e:
+                            logging.error(f"Не удалось напомнить владельцу: {e}")
+
+        except Exception as e:
+            logging.error(f"Ошибка в цикле напоминаний: {e}")
+
+        await asyncio.sleep(300)  # проверяем каждые 5 минут
+
+
 async def main():
     db.init_db()
     await bot.delete_webhook(drop_pending_updates=True)
+    asyncio.create_task(reminder_loop())
     await dp.start_polling(bot)
 
 
